@@ -1,20 +1,33 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
-use std::sync::{Arc, mpsc, Mutex};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, Shutdown};
-use std::thread;
-use std::sync::mpsc::{Receiver, Sender};
-use std::thread::JoinHandle;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
-fn handle_connection(
-    mut stream: TcpStream,
-    table: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
-    pub_tx: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>,
-    sub_rx: Arc<Mutex<HashMap<String, Arc<Mutex<Receiver<Vec<u8>>>>>>>,
-    sub_client_tx: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>,
-)-> Result<(), Box<dyn Error + 'static>> {
+#[cfg(not(feature = "tls"))]
+use std::io::{Read, Write};
+
+#[cfg(not(feature = "tls"))]
+use std::net::{TcpListener, TcpStream};
+
+#[cfg(not(feature = "tls"))]
+use std::thread;
+
+#[cfg(feature = "tls")]
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+#[cfg(feature = "tls")]
+use rustls::ServerConfig;
+
+#[cfg(feature = "tls")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[cfg(feature = "tls")]
+use tokio::net::{TcpListener, TcpStream};
+
+#[cfg(feature = "tls")]
+use tokio_rustls::TlsStream;
+
+#[cfg(not(feature = "tls"))]
+fn handle_connection(mut stream: TcpStream, table: &Arc<Mutex<HashMap<String, VecDeque<Vec<u8>>>>>) -> Result<(), Box<dyn Error + '_>> {
     loop {
         let mut buffer = [0; 1024];
         stream.read(&mut buffer)?;
@@ -28,93 +41,200 @@ fn handle_connection(
             let response = "QUIT\r\n";
             stream.write(response.as_bytes())?;
             stream.flush()?;
-            stream.shutdown(Shutdown::Both)?;
             break;
-        } else if buffer.starts_with(msg_set) || buffer.starts_with(msg_get) {
+        } else if buffer.starts_with(msg_set) {
             let row = String::from_utf8_lossy(&buffer[..]);
             let data = row.split_whitespace().collect::<Vec<&str>>();
             let key = String::from(data[1]);
-
-            // テーブルの状態チェック
+            let value = Vec::from(data[2..].join(" ").as_bytes());
             {
-                let mut table_lock = table.lock().unwrap();
-                if !&table_lock.contains_key(&key) {
-                    let (t_pub_tx, t_pub_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
-                    let (t_sub_tx, t_sub_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
-                    let (t_sub_client_tx, t_sub_client_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
-
-                    // receiverをループする
-                    let handle = thread::spawn(move || {
-                        loop {
-                            if let Ok(data) = t_pub_rx.recv() {
-                                // sub が接続されるまで待機
-                                if let Ok(_) = t_sub_client_rx.recv() {
-                                    // sub が接続されたら data をレスポンスする
-                                    t_sub_tx.send(data).unwrap();
-                                }
-                            }
-                        }
-                    });
-
-                    table_lock.insert(key.clone(), handle);
-                    pub_tx.lock().unwrap().insert(key.clone(), t_pub_tx);
-                    sub_rx.lock().unwrap().insert(key.clone(), Arc::new(Mutex::new(t_sub_rx)));
-                    sub_client_tx.lock().unwrap().insert(key.clone(), t_sub_client_tx);
+                let mut lock = table.lock()?;
+                if lock.contains_key(&key) {
+                    let queue = lock.get_mut(&key).unwrap();
+                    queue.push_back(value);
+                } else {
+                    let mut queue = VecDeque::new();
+                    queue.push_back(value);
+                    lock.insert(key, queue);
                 }
             }
 
-            if buffer.starts_with(msg_set) {
-                let value = Vec::from(data[2..].join(" ").as_bytes());
-
-                pub_tx.lock().unwrap().get_mut(&key).unwrap().send(value)?;
-
-                let response = "PUBLISHED\r\n";
-                stream.write(response.as_bytes())?;
-                stream.flush()?;
-            } else if buffer.starts_with(msg_get) {
-                // sub receiverにwriteされるまで待機(一定時間でタイムアウト) タイムアウト・切断されたらクライアント側で再接続
-                sub_client_tx.lock().unwrap().get_mut(&key).unwrap().send(vec![])?;
-                let srx = sub_rx.lock().unwrap().get(&key).unwrap().clone();
-                match srx.lock().unwrap().recv_timeout(Duration::from_millis(30000)) {
-                    Ok(response) => {
-                        stream.write(&response)?;
-                        stream.write("\r\nSUBSCRIBE\r\n".as_bytes())?;
+            let response = "PUBLISHED\r\n";
+            stream.write_all(response.as_bytes())?;
+        } else if buffer.starts_with(msg_get) {
+            let row = String::from_utf8_lossy(&buffer[..]);
+            let data = row.split_whitespace().collect::<Vec<&str>>();
+            let key = String::from(data[1]);
+            let value = {
+                let mut lock = table.lock()?;
+                let queue = lock.get_mut(&key);
+                match queue {
+                    Some(q) => {
+                        q.pop_front().unwrap_or_default()
                     },
-                    Err(_) => {
-                        stream.write("\r\nTIMEOUT\r\n".as_bytes())?;
-                    }
+                    None => vec![0; 0],
                 }
-                stream.flush()?;
-
-                // 空になったroomを削除
-                // sub_rx.lock()?.get_mut(&key).unwrap();
-            }
+            };
+            stream.write_all(&*value)?;
+            stream.write_all("\r\nSUBSCRIBE\r\n".as_bytes())?;
         }
     }
 
     Ok(())
 }
 
+#[cfg(not(feature = "tls"))]
 fn main() -> Result<(), Box<dyn Error>> {
     let host = "127.0.0.1:5555";
     let listener = TcpListener::bind(host)?;
     println!("Server listen on {}", host);
 
-    let table: Arc<Mutex<HashMap<String, JoinHandle<()>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let pub_tx: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let sub_rx: Arc<Mutex<HashMap<String, Arc<Mutex<Receiver<Vec<u8>>>>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let sub_client_tx: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let table: Arc<Mutex<HashMap<String, VecDeque<Vec<u8>>>>> =
+      Arc::new(Mutex::new(HashMap::new()));
 
     for stream in listener.incoming() {
         let stream = stream?;
-        let table = table.clone();
-        let pub_tx = pub_tx.clone();
-        let sub_rx = sub_rx.clone();
-        let sub_client_tx = sub_client_tx.clone();
+        let t = table.clone();
 
         println!("Connection established!");
         thread::spawn(move || {
-            handle_connection(stream, table, pub_tx, sub_rx, sub_client_tx).unwrap();
+            handle_connection(stream, &t).unwrap();
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "tls")]
+async fn handle_connection(mut stream: TlsStream<TcpStream>, table: &Arc<Mutex<HashMap<String, VecDeque<Vec<u8>>>>>) -> Result<(), Box<dyn Error + '_>> {
+    let msg_quit = b"quit";
+    let msg_set = b"pub";
+    let msg_get = b"sub";
+
+    loop {
+        let mut buffer = [0; 1024];
+        match stream.read(&mut buffer).await {
+            Ok(n) => {
+                println!("Request: {}", String::from_utf8_lossy(&buffer[..n]));
+
+
+                if buffer[..n].starts_with(msg_quit) {
+                    let response = "QUIT\r\n";
+                    stream.write_all(response.as_bytes()).await?;
+                    break;
+                } else if buffer.starts_with(msg_set) {
+                    let row = String::from_utf8_lossy(&buffer[..n]);
+                    let data = row.split_whitespace().collect::<Vec<&str>>();
+                    let key = String::from(data[1]);
+                    let value = Vec::from(data[2..].join(" ").as_bytes());
+                    {
+                        let mut lock = table.lock()?;
+                        if lock.contains_key(&key) {
+                            let queue = lock.get_mut(&key).unwrap();
+                            queue.push_back(value);
+                        } else {
+                            let mut queue = VecDeque::new();
+                            queue.push_back(value);
+                            lock.insert(key, queue);
+                        }
+                    }
+
+                    let response = "PUBLISHED\r\n";
+                    stream.write_all(response.as_bytes()).await?;
+                } else if buffer.starts_with(msg_get) {
+                    let row = String::from_utf8_lossy(&buffer[..n]);
+                    let data = row.split_whitespace().collect::<Vec<&str>>();
+                    let key = String::from(data[1]);
+                    let value = {
+                        let mut lock = table.lock()?;
+                        let queue = lock.get_mut(&key);
+                        match queue {
+                            Some(q) => {
+                                q.pop_front().unwrap_or_default()
+                            },
+                            None => vec![0; 0],
+                        }
+                    };
+                    stream.write_all(&*value).await?;
+                    stream.write_all("\r\nSUBSCRIBE\r\n".as_bytes()).await?;
+                }
+            }
+            Err(e) => eprintln!("Failed to read from TLS socket: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "tls")]
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    println!("Loading certificate and key ...");
+
+    let cert_file = std::fs::read("./credential/server.crt")?;
+    let key_file = std::fs::read("./credential/server.key")?;
+
+    let certs = rustls_pemfile::certs(&mut &*cert_file)
+      .collect::<Result<Vec<_>, _>>()?
+      .into_iter()
+      .map(CertificateDer::from)
+      .collect();
+
+    println!("Certificate loaded successfully");
+
+    let key = {
+        let mut reader = &mut &*key_file;
+        let mut private_keys = Vec::new();
+
+        for item in rustls_pemfile::read_all(&mut reader) {
+            match item {
+                Ok(rustls_pemfile::Item::Pkcs1Key(key)) => {
+                    println!("Found PKCS1 key");
+                    private_keys.push(PrivateKeyDer::Pkcs1(key));
+                }
+                Ok(rustls_pemfile::Item::Pkcs8Key(key)) => {
+                    println!("Found PKCS8 key");
+                    private_keys.push(PrivateKeyDer::Pkcs8(key));
+                }
+                Ok(_) => println!("Found other item"),
+                Err(e) => println!("Error reading key: {}", e),
+            }
+        }
+
+        private_keys
+          .into_iter()
+          .next()
+          .ok_or("no private key found")?
+    };
+
+    println!("Private key loaded successfully");
+
+    let config = ServerConfig::builder()
+      .with_no_client_auth()
+      .with_single_cert(certs, key)?;
+
+    println!("Server configuration created successfully");
+
+    let table: Arc<Mutex<HashMap<String, VecDeque<Vec<u8>>>>> =
+      Arc::new(Mutex::new(HashMap::new()));
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:5555").await?;
+    println!("TLS Server listening on localhost:5555");
+
+    while let Ok((stream, addr)) = listener.accept().await {
+        println!("Accepted connection from: {}", addr);
+        let acceptor = acceptor.clone();
+        let t = table.clone();
+
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    println!("TLS connection established with: {}", addr);
+                    handle_connection(TlsStream::Server(tls_stream), &t).await.unwrap();
+                }
+                Err(e) => eprintln!("TLS acceptance failed: {}", e),
+            }
         });
     }
 
